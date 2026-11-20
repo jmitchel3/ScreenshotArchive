@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2026-11-20
+
+- Add inline thumbnails, Quick Look previews, and one-click Keep & Rename in the preview list.
+- Detect custom macOS screenshot prefixes, match supported image capture formats, and organize existing flat Archive files into YYYY-MM folders.
+- Show Archive file count and on-disk size, add optional debounced failure notifications for hourly cleanup, and harden refresh/Undo safety.
+- Replace the app icon with an original vector icon, add Desktop and Downloads usage descriptions, add MIT license, and support --universal and --install in build.sh.
+
 ## 1.2.0 — 2026-11-20
 
 - Back up current and archived screenshots to an S3-compatible bucket on demand or daily at 8 PM. Restore a snapshot by expanding its dated ZIP.
