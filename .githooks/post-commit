@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+# Rebase replays commits on a detached HEAD. A mail patch series can use an attached branch.
+if [ -d "$(git rev-parse --git-path rebase-apply)" ] || [ -d "$(git rev-parse --git-path rebase-merge)" ]; then
+    exit 0
+fi
+exec ./scripts/publish.sh

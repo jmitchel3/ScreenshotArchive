@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct ArchiveCandidate: Identifiable, Hashable, Sendable {
@@ -89,6 +90,8 @@ struct ArchiveService: Sendable {
         destinationDirectory(for: modifiedDate).appendingPathComponent(file.lastPathComponent)
     }
 
+    static func isScreenshot(_ name: String) -> Bool { name.hasPrefix("Screenshot ") }
+
     func scan(days: Int, now: Date = Date()) throws -> ArchiveScan {
         let fm = FileManager.default
         let cutoff = now.addingTimeInterval(-Double(max(1, days)) * 86400)
@@ -100,7 +103,7 @@ struct ArchiveService: Sendable {
 
         var result = ArchiveScan()
         for file in files {
-            guard file.lastPathComponent.hasPrefix("Screenshot ") else { continue }
+            guard Self.isScreenshot(file.lastPathComponent) else { continue }
             guard let info = try? file.resourceValues(forKeys: Self.resourceKeys) else { continue }
             guard info.isRegularFile == true, info.isSymbolicLink != true else { continue }
             guard let modified = info.contentModificationDate, modified <= cutoff else {
@@ -200,11 +203,9 @@ struct ArchiveService: Sendable {
             }
         }
 
-        // Remove any monthly subfolders that became empty after restoring.
+        // rmdir checks emptiness at removal time, even if another cleanup is archiving files.
         for dir in touchedSubdirs {
-            if let contents = try? fm.contentsOfDirectory(atPath: dir.path), contents.isEmpty {
-                try? fm.removeItem(at: dir)
-            }
+            _ = rmdir(fm.fileSystemRepresentation(withPath: dir.path))
         }
 
         return result

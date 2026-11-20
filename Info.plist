@@ -14,6 +14,6 @@
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSDocumentsFolderUsageDescription</key>
-  <string>Move older screenshots into Archive and preview the files ready for cleanup.</string>
+  <string>Preview and archive screenshots, and back them up when you enable object storage backups.</string>
 </dict>
 </plist>

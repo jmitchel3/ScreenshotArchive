@@ -1,19 +1,6 @@
 import SwiftUI
 import AppKit
 
-enum LaunchAgentStatus: Equatable, Sendable {
-    case disabled
-    case enabled
-    case stalePath(installedPath: String)
-
-    var isEnabled: Bool {
-        switch self {
-        case .enabled, .stalePath: return true
-        case .disabled: return false
-        }
-    }
-}
-
 struct AutoRunStatus: Equatable, Sendable {
     let date: Date
     let moved: Int
@@ -34,7 +21,6 @@ enum ProblemKind: Equatable, Sendable {
 }
 
 enum Settings {
-    static let label = "com.jmitch.screenshot-archive"
     static let daysKey = "archiveDays"
     static let organizeByMonthKey = "organizeByMonth"
     static let customFolderKey = "customFolderPath"
@@ -73,11 +59,6 @@ enum Settings {
 
     static var hasCustomFolder: Bool {
         UserDefaults.standard.string(forKey: customFolderKey) != nil
-    }
-
-    static var agent: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
     }
 
     static var logURL: URL {
@@ -149,92 +130,13 @@ enum Settings {
             try? handle.write(contentsOf: data)
         }
     }
-
-    @discardableResult
-    static func launchctl(_ arguments: [String], allowFailure: Bool = false) throws -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardError = pipe
-        process.standardOutput = FileHandle.nullDevice
-        try process.run()
-        let output = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        if process.terminationStatus != 0 && !allowFailure {
-            let message = String(data: output, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw NSError(
-                domain: label,
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: (message?.isEmpty == false ? message! : "Could not update automatic cleanup.")]
-            )
-        }
-        return process.terminationStatus
-    }
-
-    static func installedAgentAppPath() -> String? {
-        guard let data = try? Data(contentsOf: agent),
-              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              let args = plist["ProgramArguments"] as? [String],
-              let appFlagIndex = args.firstIndex(of: "-a"),
-              args.indices.contains(appFlagIndex + 1) else {
-            return nil
-        }
-        return args[appFlagIndex + 1]
-    }
-
-    static func agentStatus() -> LaunchAgentStatus {
-        guard FileManager.default.fileExists(atPath: agent.path) else {
-            return .disabled
-        }
-        guard (try? launchctl(["print", "gui/\(getuid())/\(label)"], allowFailure: true)) == 0 else {
-            return .disabled
-        }
-        let currentPath = Bundle.main.bundleURL.standardizedFileURL.path
-        if let installed = installedAgentAppPath() {
-            let normalizedInstalled = URL(fileURLWithPath: installed).standardizedFileURL.path
-            if normalizedInstalled != currentPath {
-                return .stalePath(installedPath: installed)
-            }
-        }
-        return .enabled
-    }
-
-    static func setAutomatic(_ enabled: Bool) throws {
-        let domain = "gui/\(getuid())"
-        _ = try launchctl(["bootout", "\(domain)/\(label)"], allowFailure: true)
-        if enabled {
-            let plist: [String: Any] = [
-                "Label": label,
-                "ProgramArguments": [
-                    "/usr/bin/open", "-g", "-W", "-n", "-a",
-                    Bundle.main.bundleURL.path,
-                    "--args", "--background"
-                ],
-                "RunAtLoad": true,
-                "StartInterval": 3600,
-                "ProcessType": "Background",
-                "AssociatedBundleIdentifiers": [Bundle.main.bundleIdentifier ?? "com.jmitch.screenshot-archive.helper"]
-            ]
-            try FileManager.default.createDirectory(at: agent.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-            try data.write(to: agent, options: .atomic)
-            do {
-                try launchctl(["bootstrap", domain, agent.path])
-            } catch {
-                try? FileManager.default.removeItem(at: agent)
-                throw error
-            }
-        } else if FileManager.default.fileExists(atPath: agent.path) {
-            try FileManager.default.removeItem(at: agent)
-        }
-    }
 }
 
 @MainActor
 final class ArchiveModel: ObservableObject {
     @Published var scan = ArchiveScan()
-    @Published var agentStatus: LaunchAgentStatus = .disabled
+    @Published var agentStatus: LaunchAgentStatus?
+    @Published var scheduleError: String?
     @Published var lastAutoRun: AutoRunStatus? = Settings.lastAutoRun
     @Published var days: Int = Settings.days
     @Published var organizeByMonth: Bool = Settings.organizeByMonth
@@ -246,6 +148,7 @@ final class ArchiveModel: ObservableObject {
     @Published var isUpdatingSchedule = false
 
     private var refreshTask: Task<Void, Never>?
+    private var scheduleRevision = 0
 
     var service: ArchiveService {
         ArchiveService(folder: folder, organizeByMonth: organizeByMonth)
@@ -297,6 +200,7 @@ final class ArchiveModel: ObservableObject {
 
     func refresh() {
         refreshTask?.cancel()
+        let revision = scheduleRevision
         let currentService = service
         let currentDays = days
 
@@ -306,7 +210,7 @@ final class ArchiveModel: ObservableObject {
 
             let outcome = await Task.detached(priority: .userInitiated) { () -> (Result<ArchiveScan, Error>, LaunchAgentStatus) in
                 let scanResult = Result { try currentService.scan(days: currentDays) }
-                let status = Settings.agentStatus()
+                let status = LaunchAgent.current.status()
                 return (scanResult, status)
             }.value
 
@@ -320,7 +224,7 @@ final class ArchiveModel: ObservableObject {
                 scan = ArchiveScan()
                 problem = classifyError(error, folder: currentService.folder)
             }
-            agentStatus = outcome.1
+            if revision == scheduleRevision && !isUpdatingSchedule { agentStatus = outcome.1 }
             lastAutoRun = Settings.lastAutoRun
         }
     }
@@ -388,31 +292,28 @@ final class ArchiveModel: ObservableObject {
 
     func setAutomatic(_ enabled: Bool) {
         guard !isUpdatingSchedule else { return }
+        isUpdatingSchedule = true
+        scheduleError = nil
         Task {
-            isUpdatingSchedule = true
-            defer { isUpdatingSchedule = false }
-
             let outcome = await Task.detached(priority: .userInitiated) { () -> (Error?, LaunchAgentStatus) in
                 do {
-                    try Settings.setAutomatic(enabled)
-                    return (nil, Settings.agentStatus())
+                    try LaunchAgent.current.setAutomatic(enabled)
+                    return (nil, LaunchAgent.current.status())
                 } catch {
-                    return (error, Settings.agentStatus())
+                    return (error, LaunchAgent.current.status())
                 }
             }.value
 
+            scheduleRevision += 1
+            isUpdatingSchedule = false
             agentStatus = outcome.1
             lastAutoRun = Settings.lastAutoRun
             if let error = outcome.0 {
-                problem = .general(error.localizedDescription)
-            } else {
-                problem = nil
-                message = enabled ? "Automatic cleanup is on. Checks every hour." : "Automatic cleanup is off."
-                if enabled {
-                    // Refresh shortly after launchctl RunAtLoad triggers a background run.
-                    try? await Task.sleep(nanoseconds: 1_200_000_000)
-                    refresh()
-                }
+                scheduleError = error.localizedDescription
+            } else if enabled {
+                // Refresh shortly after launchctl RunAtLoad triggers a background run.
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                refresh()
             }
         }
     }
@@ -450,11 +351,12 @@ final class ArchiveModel: ObservableObject {
     }
 
     private func refreshKeepingProblemIfNeeded(preserveError: Bool) async {
+        let revision = scheduleRevision
         let currentService = service
         let currentDays = days
         let outcome = await Task.detached(priority: .userInitiated) { () -> (Result<ArchiveScan, Error>, LaunchAgentStatus) in
             let scanResult = Result { try currentService.scan(days: currentDays) }
-            let status = Settings.agentStatus()
+            let status = LaunchAgent.current.status()
             return (scanResult, status)
         }.value
 
@@ -466,7 +368,7 @@ final class ArchiveModel: ObservableObject {
             scan = ArchiveScan()
             problem = classifyError(error, folder: currentService.folder)
         }
-        agentStatus = outcome.1
+        if revision == scheduleRevision && !isUpdatingSchedule { agentStatus = outcome.1 }
         lastAutoRun = Settings.lastAutoRun
     }
 
@@ -488,6 +390,7 @@ final class ArchiveModel: ObservableObject {
 struct ArchiveView: View {
     @StateObject private var model = ArchiveModel()
     @State private var showingFiles = false
+    @State private var showingBackups = false
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
@@ -505,6 +408,7 @@ struct ArchiveView: View {
         }
         .padding(24)
         .frame(width: 440)
+        .sheet(isPresented: $showingBackups) { BackupView() }
         .onAppear {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
@@ -649,19 +553,37 @@ struct ArchiveView: View {
             .toggleStyle(.switch)
             .controlSize(.small)
 
-            Toggle("Clean up automatically every hour", isOn: Binding(
-                get: { model.agentStatus.isEnabled },
-                set: { model.setAutomatic($0) }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .disabled(model.isUpdatingSchedule)
+            if let enabled = model.agentStatus?.isEnabled {
+                Toggle("Clean up automatically every hour", isOn: Binding(
+                    get: { enabled },
+                    set: { model.setAutomatic($0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(model.isUpdatingSchedule)
+            } else if case .unavailable(let reason) = model.agentStatus {
+                HStack {
+                    Text("Could not check hourly cleanup. \(reason)")
+                        .font(.caption)
+                    Button("Retry", action: model.refresh)
+                        .controlSize(.small)
+                }
+            } else {
+                Text("Checking hourly cleanup…").font(.caption)
+            }
 
-            if case .stalePath = model.agentStatus {
+            if let error = model.scheduleError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
+            if let explanation = model.agentStatus?.repairMessage {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
-                    Text("App moved since schedule was enabled.")
+                    Text(explanation)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -669,6 +591,7 @@ struct ArchiveView: View {
                         model.setAutomatic(true)
                     }
                     .controlSize(.small)
+                    .disabled(model.isUpdatingSchedule)
                 }
             }
 
@@ -738,6 +661,7 @@ struct ArchiveView: View {
     private var footerSection: some View {
         HStack {
             Button("Open Archive", action: model.openArchive)
+            Button("Backups…") { showingBackups = true }
             Spacer()
             Button("Clean Up Now", action: model.clean)
                 .buttonStyle(.borderedProminent)
@@ -758,6 +682,13 @@ struct ScreenshotArchiveApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
+        if CommandLine.arguments.contains("--backup") {
+            Task.detached {
+                let result = await Settings.runBackup(interactive: false)
+                exit(result.failed ? 1 : 0)
+            }
+            dispatchMain()
+        }
         if CommandLine.arguments.contains("--background") {
             let service = ArchiveService(
                 folder: Settings.folder,

@@ -1,0 +1,4 @@
+#!/bin/sh
+# A squash merge has only staged the changes. The subsequent commit publishes them.
+[ "$1" = 0 ] || exit 0
+exec ./scripts/publish.sh

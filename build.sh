@@ -13,7 +13,7 @@ trap '/bin/rm -rf -- "$archive_build"' EXIT
 
 /usr/bin/xcrun swiftc -O -warnings-as-errors -parse-as-library -target arm64-apple-macosx13.0 \
   -module-cache-path "$archive_build/ModuleCache" \
-  ArchiveCore.swift ScreenshotArchive.swift \
+  ArchiveCore.swift LaunchAgent.swift ObjectBackup.swift BackupView.swift ScreenshotArchive.swift \
   -o "$archive_build/Screenshot Archive.app/Contents/MacOS/ScreenshotArchive"
 
 /usr/bin/xcrun swiftc -O -target arm64-apple-macosx13.0 \

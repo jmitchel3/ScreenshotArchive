@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: /bin/zsh -f test.sh
+
+      - name: Build app bundle (ad-hoc signed)
+        env:
+          SIGN_IDENTITY: "-"
+        run: /bin/zsh -f build.sh
