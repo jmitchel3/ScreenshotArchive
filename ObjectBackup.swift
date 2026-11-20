@@ -178,8 +178,14 @@ private final class BackupRedirectDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
-struct ObjectBackup {
+struct ObjectBackup: Sendable {
     let folder: URL
+    let screenshotPrefixes: [String]
+
+    init(folder: URL, screenshotPrefixes: [String] = [ArchiveService.defaultPrefix]) {
+        self.folder = folder
+        self.screenshotPrefixes = screenshotPrefixes.isEmpty ? [ArchiveService.defaultPrefix] : screenshotPrefixes
+    }
 
     func run(upload: (URL) async throws -> Void) async throws -> String {
         let paths = try screenshotPaths()
@@ -224,7 +230,7 @@ struct ObjectBackup {
                 let name = entry.lastPathComponent
                 let isArchive = prefix.isEmpty && name == "Archive"
                 let isMonth = prefix == "Archive/" && name.range(of: #"^[0-9]{4}-(0[1-9]|1[0-2])$"#, options: .regularExpression) != nil
-                guard isArchive || isMonth || ArchiveService.isScreenshot(name) else { continue }
+                guard isArchive || isMonth || ArchiveService.isScreenshot(name, prefixes: screenshotPrefixes) else { continue }
                 let info = try entry.resourceValues(forKeys: keys)
                 if isArchive && info.isSymbolicLink == true { throw ArchiveError.archiveIsSymlink }
                 guard info.isSymbolicLink != true else { continue }

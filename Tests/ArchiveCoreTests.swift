@@ -64,6 +64,13 @@ struct ArchiveCoreTestRunner {
             ("empty and failed backups clean up without reporting an upload", testBackupFailure),
             ("unverified unloads preserve the schedule file and report the failure", testUnverifiedUnload),
             ("schedule status distinguishes an orphaned job, a pending plist and a lookup error", testScheduleStatus),
+            ("prefix matching supports custom names, dateless captures, and excludes non-images", testPrefixAndFormatMatching),
+            ("organizeArchive moves flat files into YYYY-MM, skips collisions, and is idempotent", testOrganizeArchive),
+            ("renameToKeep preserves extension and rejects invalid names or prefix matches", testRenameToKeep),
+            ("restore skips replaced file identity and symlinked month directories", testRestoreIdentityAndSymlinkSafety),
+            ("archiveStats counts files, allocated bytes, and skips symlinks", testArchiveStats),
+            ("failure notification policy debounces repeated categories and resets", testFailureNotificationPolicy),
+            ("backup supports custom and legacy archived prefixes while excluding txt", testBackupCustomPrefixes),
             ("error classification distinguishes missing folder and permission errors", testErrorClassification)
         ]
 
@@ -479,6 +486,196 @@ struct ArchiveCoreTestRunner {
             try agent.setAutomatic(false)
             try expectEqual(agent.status(), .disabled)
         }
+    }
+
+    static func testPrefixAndFormatMatching() throws {
+        try expect(ArchiveService.isScreenshot("Screenshot 2026-11-20 at 10.00.00 AM.png"), "standard screenshot")
+        try expect(ArchiveService.isScreenshot("Screenshot.png"), "dateless screenshot")
+        try expect(ArchiveService.isScreenshot("Screenshot 2.HEIC"), "uppercase image extension")
+        try expect(!ArchiveService.isScreenshot("Screenshot notes.txt"), "text file must not match")
+        try expect(!ArchiveService.isScreenshot("Screen Recording 2026.mov"), "screen recording must not match")
+        try expect(!ArchiveService.isScreenshot("Screenshotter.png"), "partial word prefix must not match")
+        try expect(!ArchiveService.isScreenshot(".Screenshot hidden.png"), "hidden file must not match")
+
+        try expect(ArchiveService.isScreenshot("Shot 2026-11-20.png", prefix: "Shot"), "custom prefix with date")
+        try expect(ArchiveService.isScreenshot("Shot.jpg", prefix: "Shot"), "custom dateless prefix")
+        try expect(!ArchiveService.isScreenshot("Screenshot 2026-11-20.png", prefix: "Shot"), "non-matching active prefix")
+        try expect(
+            ArchiveService.isScreenshot("Screenshot 2026-11-20.png", prefixes: ["Shot", "Screenshot"]),
+            "legacy prefix match in Archive"
+        )
+        try expectEqual(ArchiveService.normalizedPrefix("   "), ArchiveService.defaultPrefix)
+        try expectEqual(ArchiveService.normalizedPrefix("  Capture  "), "Capture")
+    }
+
+    static func testOrganizeArchive() throws {
+        try withTempDir { dir in
+            let octDate = isoDate("2026-10-15T18:30:00Z")
+            let novDate = isoDate("2026-11-02T09:00:00Z")
+            let archive = dir.appendingPathComponent("Archive", isDirectory: true)
+
+            try makeFile(in: archive, name: "Screenshot oct.png", contents: "oct", modifiedAt: octDate)
+            try makeFile(in: archive, name: "Shot nov.png", contents: "nov", modifiedAt: novDate)
+            try makeFile(in: archive, name: "Screenshot dup.png", contents: "flat-dup", modifiedAt: octDate)
+            try makeFile(in: archive, name: "Screenshot notes.txt", contents: "ignore-txt", modifiedAt: octDate)
+            try makeFile(in: archive.appendingPathComponent("2026-10", isDirectory: true), name: "Screenshot dup.png", contents: "existing-dup", modifiedAt: octDate)
+
+            let service = ArchiveService(folder: dir, organizeByMonth: true, screenshotPrefix: "Shot", timeZone: TimeZone(secondsFromGMT: 0)!)
+            let first = try service.organizeArchive()
+            try expectEqual(first.moved, 2, "should move both legacy Screenshot and active Shot")
+            try expectEqual(first.skippedCollisions, 1, "should skip colliding filename")
+            try expect(first.errors.isEmpty, "no errors expected")
+            try expect(FileManager.default.fileExists(atPath: archive.appendingPathComponent("2026-10/Screenshot oct.png").path), "oct screenshot should be in 2026-10")
+            try expect(FileManager.default.fileExists(atPath: archive.appendingPathComponent("2026-11/Shot nov.png").path), "nov screenshot should be in 2026-11")
+            try expect(FileManager.default.fileExists(atPath: archive.appendingPathComponent("Screenshot notes.txt").path), "non-image stays untouched")
+            try expectEqual(try String(contentsOf: archive.appendingPathComponent("2026-10/Screenshot dup.png"), encoding: .utf8), "existing-dup")
+
+            // Second run must be idempotent.
+            let second = try service.organizeArchive()
+            try expectEqual(second.moved, 0)
+            try expectEqual(second.skippedCollisions, 1)
+
+            // Intervening hourly cleanup followed by Undo of organizeArchive must leave the new arrival intact.
+            let now = isoDate("2026-11-20T12:00:00Z")
+            try makeFile(in: dir, name: "Shot later.png", contents: "later", modifiedAt: octDate)
+            let hourly = try service.clean(days: 1, now: now)
+            try expectEqual(hourly.moved, 1)
+
+            let undo = service.restore(first.moves)
+            try expectEqual(undo.restored, 2)
+            try expect(undo.errors.isEmpty, "undo should have no errors")
+            try expect(FileManager.default.fileExists(atPath: archive.appendingPathComponent("Screenshot oct.png").path), "oct screenshot restored to flat Archive")
+            try expect(FileManager.default.fileExists(atPath: archive.appendingPathComponent("2026-10/Shot later.png").path), "later arrival preserved")
+            try expect(!FileManager.default.fileExists(atPath: archive.appendingPathComponent("2026-11").path), "empty 2026-11 removed")
+        }
+    }
+
+    static func testRenameToKeep() throws {
+        try withTempDir { dir in
+            let old = isoDate("2026-10-15T12:00:00Z")
+            let file = try makeFile(in: dir, name: "Screenshot 2026-10-15.png", contents: "img", modifiedAt: old)
+            try makeFile(in: dir, name: "Existing.png", contents: "other", modifiedAt: old)
+
+            let service = ArchiveService(folder: dir)
+
+            for badStem in ["", "   ", ".", "..", "a/b", "a:b", "Screenshot still-matches"] {
+                do {
+                    _ = try service.renameToKeep(file, newStem: badStem)
+                    throw TestFailure(description: "Accepted invalid stem '\(badStem)'")
+                } catch is KeepRenameError {
+                    // expected
+                }
+            }
+
+            do {
+                _ = try service.renameToKeep(file, newStem: "Existing")
+                throw TestFailure(description: "Accepted colliding filename")
+            } catch let error as KeepRenameError {
+                try expectEqual(error, .destinationExists)
+            }
+
+            let renamed = try service.renameToKeep(file, newStem: "Receipt Oct")
+            try expectEqual(renamed.lastPathComponent, "Receipt Oct.png")
+            try expect(FileManager.default.fileExists(atPath: renamed.path), "renamed file should exist")
+            try expect(!FileManager.default.fileExists(atPath: file.path), "original filename should be gone")
+        }
+    }
+
+    static func testRestoreIdentityAndSymlinkSafety() throws {
+        try withTempDir { dir in
+            let now = isoDate("2026-11-20T12:00:00Z")
+            let octDate = isoDate("2026-10-15T12:00:00Z")
+            let novDate = isoDate("2026-11-02T12:00:00Z")
+
+            try makeFile(in: dir, name: "Screenshot A.png", contents: "orig-A", modifiedAt: octDate)
+            try makeFile(in: dir, name: "Screenshot B.png", contents: "orig-B", modifiedAt: novDate)
+
+            let service = ArchiveService(folder: dir, organizeByMonth: true, timeZone: TimeZone(secondsFromGMT: 0)!)
+            let cleaned = try service.clean(days: 1, now: now)
+            try expectEqual(cleaned.moved, 2)
+
+            // Replace archived Screenshot A with a brand new file (different inode).
+            let destA = service.archive.appendingPathComponent("2026-10/Screenshot A.png")
+            try FileManager.default.removeItem(at: destA)
+            try makeFile(in: destA.deletingLastPathComponent(), name: "Screenshot A.png", contents: "impostor-A", modifiedAt: now)
+
+            // Replace 2026-11 directory with a symlink to an external directory containing Screenshot B.
+            let external = dir.appendingPathComponent("External", isDirectory: true)
+            try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+            let destB = service.archive.appendingPathComponent("2026-11/Screenshot B.png")
+            try FileManager.default.moveItem(at: destB, to: external.appendingPathComponent("Screenshot B.png"))
+            try FileManager.default.removeItem(at: service.archive.appendingPathComponent("2026-11"))
+            try FileManager.default.createSymbolicLink(
+                at: service.archive.appendingPathComponent("2026-11"),
+                withDestinationURL: external
+            )
+
+            let restored = service.restore(cleaned.moves)
+            try expectEqual(restored.restored, 0, "neither impostor nor symlink-traversed file should restore")
+            try expectEqual(restored.skipped, 2)
+        }
+    }
+
+    static func testArchiveStats() throws {
+        try withTempDir { dir in
+            let old = isoDate("2026-10-15T12:00:00Z")
+            let archive = dir.appendingPathComponent("Archive", isDirectory: true)
+            try makeFile(in: archive, name: "Screenshot flat.png", contents: String(repeating: "a", count: 4096), modifiedAt: old)
+            try makeFile(in: archive.appendingPathComponent("2026-10", isDirectory: true), name: "Screenshot nested.png", contents: "hello", modifiedAt: old)
+            try makeFile(in: archive, name: "notes.txt", contents: "notes", modifiedAt: old)
+
+            let external = dir.appendingPathComponent("External", isDirectory: true)
+            try makeFile(in: external, name: "Screenshot outside.png", contents: "outside", modifiedAt: old)
+            try FileManager.default.createSymbolicLink(
+                at: archive.appendingPathComponent("LinkedDir"),
+                withDestinationURL: external
+            )
+
+            let service = ArchiveService(folder: dir)
+            let stats = service.archiveStats()
+            try expectEqual(stats.fileCount, 3, "should count real files inside Archive and ignore symlinked dir")
+            try expectEqual(stats.flatMatchingCount, 1, "only top-level matching screenshot counts as flat")
+            try expect(stats.allocatedBytes > 0, "allocated bytes should be non-zero")
+            try expect(!stats.partial, "clean walk should not be partial")
+        }
+    }
+
+    static func testFailureNotificationPolicy() throws {
+        let t0 = isoDate("2026-11-20T12:00:00Z")
+        var state = FailureNotificationState()
+        try expect(FailureNotificationPolicy.shouldNotify(category: .permission, state: state, now: t0), "first failure notifies")
+
+        state = FailureNotificationState(lastCategory: FailureCategory.permission.rawValue, lastSentAt: t0)
+        try expect(
+            !FailureNotificationPolicy.shouldNotify(category: .permission, state: state, now: t0.addingTimeInterval(3600)),
+            "same category within cooldown is debounced"
+        )
+        try expect(
+            FailureNotificationPolicy.shouldNotify(category: .missingFolder, state: state, now: t0.addingTimeInterval(3600)),
+            "new category notifies immediately"
+        )
+        try expect(
+            FailureNotificationPolicy.shouldNotify(category: .permission, state: state, now: t0.addingTimeInterval(6 * 3600)),
+            "same category notifies again after cooldown"
+        )
+        try expect(!FailureNotificationPolicy.notificationBody(for: .partialFailure, failedCount: 2).contains(".png"), "body must not leak filenames")
+    }
+
+    static func testBackupCustomPrefixes() async throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        let included = ["Shot 2026-11-20.png", "Archive/Screenshot legacy.png"]
+        let excluded = ["Shot notes.txt", "Kept receipt.png"]
+        for path in included + excluded {
+            let url = dir.appendingPathComponent(path)
+            try makeFile(in: url.deletingLastPathComponent(), name: url.lastPathComponent, contents: path, modifiedAt: Date())
+        }
+
+        let summary = try await ObjectBackup(folder: dir, screenshotPrefixes: ["Shot", "Screenshot"]).run { _ in }
+        try expectEqual(summary, "Backed up 2 screenshots.")
     }
 
     static func testErrorClassification() throws {

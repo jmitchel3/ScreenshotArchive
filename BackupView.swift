@@ -34,7 +34,9 @@ extension Settings {
             guard let destination = backupDestination else { throw BackupError("Save a backup destination first.") }
             let secret = try BackupKeychain.read(for: destination, interactive: interactive)
             let uploader = S3Upload(destination: destination, secret: secret)
-            let summary = try await ObjectBackup(folder: folder).run(upload: uploader.upload)
+            let activePrefix = screenshotPrefix
+            let prefixes = activePrefix == ArchiveService.defaultPrefix ? [activePrefix] : [activePrefix, ArchiveService.defaultPrefix]
+            let summary = try await ObjectBackup(folder: folder, screenshotPrefixes: prefixes).run(upload: uploader.upload)
             result = BackupRunStatus(date: Date(), summary: summary, failed: false)
         } catch {
             result = BackupRunStatus(date: Date(), summary: error.localizedDescription, failed: true)

@@ -14,6 +14,10 @@
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSDocumentsFolderUsageDescription</key>
-  <string>Preview and archive screenshots, and back them up when you enable object storage backups.</string>
+  <string>Preview and archive screenshots in Documents, and back them up when you enable object storage backups.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Preview and archive screenshots on Desktop, and back them up when you enable object storage backups.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Preview and archive screenshots in Downloads, and back them up when you enable object storage backups.</string>
 </dict>
 </plist>
